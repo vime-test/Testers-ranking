@@ -3,15 +3,15 @@
   "placements": {
     "_CHEN_.png": {
       "row": 1,
-      "slot": 1
+      "slot": 0
     },
     "Aksyo.png": {
       "row": 2,
-      "slot": 0
+      "slot": 2
     },
     "bloodbarf.png": {
-      "row": 1,
-      "slot": 0
+      "row": 0,
+      "slot": 2
     },
     "Dusha.png": {
       "row": 0,
@@ -19,15 +19,15 @@
     },
     "fosques.png": {
       "row": 3,
-      "slot": 2
+      "slot": 1
     },
     "Hamitchi.png": {
       "row": 1,
-      "slot": 3
+      "slot": 1
     },
     "Inga.png": {
       "row": 3,
-      "slot": 1
+      "slot": 0
     },
     "Kaossent.png": {
       "row": 1,
@@ -38,12 +38,12 @@
       "slot": 1
     },
     "saxie.png": {
-      "row": 3,
-      "slot": 0
+      "row": 2,
+      "slot": 1
     },
     "Stozeks.png": {
       "row": 2,
-      "slot": 1
+      "slot": 0
     }
   }
 }
