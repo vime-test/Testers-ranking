@@ -17,6 +17,9 @@
       <div class="folder-row" id="folderRow" hidden>
         <button type="button" class="btn btn-ghost" id="folderBtn">Connect folder…</button>
       </div>
+      <div class="folder-row" id="githubRow" hidden>
+        <button type="button" class="btn btn-ghost" id="githubConnectBtn">Connect GitHub…</button>
+      </div>
     </header>
 
     <div class="tray-body" id="trayBody" aria-label="Unplaced items">
@@ -28,6 +31,7 @@
     <footer class="tray-footer">
       <button type="button" class="btn" id="copyBtn">Copy PNG</button>
       <button type="button" class="btn btn-primary" id="exportBtn">Export PNG</button>
+      <button type="button" class="btn" id="saveGithubBtn" hidden>Save to GitHub</button>
     </footer>
   </aside>
 
@@ -62,6 +66,28 @@
     <div class="dialog-actions">
       <button type="button" class="btn" id="cancelBtn">Cancel</button>
       <button type="submit" class="btn btn-primary" id="commitBtn" disabled>Add to tray</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="githubDialog" class="add-dialog">
+  <form method="dialog" id="githubForm">
+    <h2>Connect GitHub</h2>
+    <p>
+      Paste a fine-grained personal access token scoped to only this repo, with
+      "Contents: Read and write" permission. Set an expiration when you create it &mdash;
+      you can always make a new one later. Stored in this browser only (localStorage) and
+      sent directly to api.github.com; anyone with access to this browser's storage &mdash;
+      including any installed extension with broad permissions, not just someone at your
+      device &mdash; can read it back out. Use this only on a device you trust.
+    </p>
+    <label class="file-field">
+      <span>Personal access token</span>
+      <input type="password" id="githubTokenInput" autocomplete="off">
+    </label>
+    <div class="dialog-actions">
+      <button type="button" class="btn" id="githubCancelBtn">Cancel</button>
+      <button type="submit" class="btn btn-primary" id="githubCommitBtn">Connect</button>
     </div>
   </form>
 </dialog>

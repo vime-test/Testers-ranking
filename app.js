@@ -69,6 +69,18 @@
   // library" below. Its manifest.json/layout.json live here too.
   var DEFAULT_LIBRARY_DIR = "assets/items/";
 
+  // Site owner's own GitHub repo — fill these in for your own fork to
+  // enable "Save to GitHub" (see that section below). Left blank, the
+  // whole feature stays hidden. GITHUB_BRANCH must match whichever
+  // branch GitHub Pages actually deploys from for this repo — a
+  // mismatch here silently writes to a branch nobody's serving.
+  var GITHUB_OWNER = "";
+  var GITHUB_REPO = "";
+  var GITHUB_BRANCH = "main";
+  var GITHUB_TOKEN_KEY = "testers-ranking:github-token"; // namespaced — this repo gets forked
+  var GITHUB_LAYOUT_PATH = DEFAULT_LIBRARY_DIR + "layout.json";
+  var GITHUB_CONFIGURED = !!(GITHUB_OWNER && GITHUB_REPO);
+
   // -------------------------------------------------------------
   // State
   // -------------------------------------------------------------
@@ -91,6 +103,9 @@
   var exportBtn = document.getElementById("exportBtn");
   var folderRow = document.getElementById("folderRow");
   var folderBtn = document.getElementById("folderBtn");
+  var githubRow = document.getElementById("githubRow");
+  var githubConnectBtn = document.getElementById("githubConnectBtn");
+  var saveGithubBtn = document.getElementById("saveGithubBtn");
 
   var stage = document.getElementById("stage");
   var canvasWrap = document.getElementById("canvasWrap");
@@ -106,6 +121,11 @@
   var fileRows = document.getElementById("fileRows");
   var cancelBtn = document.getElementById("cancelBtn");
   var commitBtn = document.getElementById("commitBtn");
+
+  var githubDialog = document.getElementById("githubDialog");
+  var githubForm = document.getElementById("githubForm");
+  var githubTokenInput = document.getElementById("githubTokenInput");
+  var githubCancelBtn = document.getElementById("githubCancelBtn");
 
   var dragGhost = document.getElementById("dragGhost");
   var exportCanvas = document.getElementById("exportCanvas");
@@ -1179,6 +1199,194 @@
   // added, instead of racing it if the same folder happens to be the
   // one already connected locally.
   loadDefaultLibrary().then(initFolderSync);
+
+  // -------------------------------------------------------------
+  // GitHub save — lets the site owner (not visitors) push the current
+  // board layout back to GITHUB_LAYOUT_PATH in their own repo via the
+  // GitHub Contents API, directly from the browser. Entirely separate
+  // from folder sync's writeLayoutFile() above: different transport
+  // (GitHub API vs local File System Access API), different trigger
+  // (manual click, not automatic on every drop — each API write is a
+  // permanent commit, and auto-saving every drag would spam the repo's
+  // history with one commit per drop). The two don't share state and
+  // don't need to agree with each other.
+  //
+  // Scope: rearrangement of the existing shipped avatars only —
+  // buildPlacementsMap() (above) is reused as-is. This does not upload
+  // new avatar images, update manifest.json, or ever read GitHub state
+  // back into the board; it's write-only.
+  // -------------------------------------------------------------
+
+  var githubUiState = "unconfigured"; // 'unconfigured' | 'disconnected' | 'connected'
+  var saveGithubInFlight = false;
+
+  function getGithubToken() { return localStorage.getItem(GITHUB_TOKEN_KEY); }
+  function setGithubToken(token) { localStorage.setItem(GITHUB_TOKEN_KEY, token); }
+
+  function setGithubUiState(nextState) {
+    githubUiState = nextState;
+    if (!GITHUB_CONFIGURED) {
+      githubRow.hidden = true;
+      saveGithubBtn.hidden = true;
+      return;
+    }
+    githubRow.hidden = false;
+    if (nextState === "disconnected") {
+      githubConnectBtn.textContent = "Connect GitHub…";
+      saveGithubBtn.hidden = true;
+    } else if (nextState === "connected") {
+      githubConnectBtn.textContent = "GitHub: connected";
+      saveGithubBtn.hidden = false;
+    }
+  }
+
+  function initGithubSync() {
+    if (!GITHUB_CONFIGURED) {
+      setGithubUiState("unconfigured");
+      return;
+    }
+    setGithubUiState(getGithubToken() ? "connected" : "disconnected");
+  }
+
+  githubConnectBtn.addEventListener("click", function () {
+    if (githubDialog.open) return; // guard rapid double-clicks, same as the Add-image dialog
+    githubTokenInput.value = getGithubToken() || "";
+    githubDialog.showModal();
+  });
+
+  githubCancelBtn.addEventListener("click", function () {
+    githubDialog.close();
+  });
+
+  githubForm.addEventListener("submit", function () {
+    var token = githubTokenInput.value.trim();
+    if (token) setGithubToken(token);
+    setGithubUiState(token ? "connected" : "disconnected");
+  });
+
+  githubDialog.addEventListener("close", function () {
+    githubTokenInput.value = ""; // never leave the token sitting in the DOM after the dialog closes
+  });
+
+  function githubApiUrl(path) {
+    return "https://api.github.com/repos/" + GITHUB_OWNER + "/" + GITHUB_REPO +
+      "/contents/" + path + "?ref=" + encodeURIComponent(GITHUB_BRANCH);
+  }
+
+  function utf8ToBase64(str) {
+    // btoa() only handles Latin1; TextEncoder gets the raw UTF-8 bytes
+    // first so this survives non-ASCII avatar names down the line, even
+    // though layout.json's keys (filenames) are ASCII-only today.
+    var bytes = new TextEncoder().encode(str);
+    var binary = "";
+    for (var i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary);
+  }
+
+  // Fetches the current sha right before writing — never reused from an
+  // earlier load — to avoid a stale-sha 409 later. A 404 here isn't an
+  // error, it just means the file doesn't exist yet: sha comes back
+  // null, and the caller omits it from the PUT so GitHub creates it.
+  async function githubGetSha() {
+    var res = await fetch(githubApiUrl(GITHUB_LAYOUT_PATH), {
+      headers: {
+        "Authorization": "Bearer " + getGithubToken(),
+        "Accept": "application/vnd.github+json"
+      }
+    });
+    if (res.status === 404) return { ok: true, sha: null };
+    if (!res.ok) return { ok: false, status: res.status, headers: res.headers };
+    var body = await res.json();
+    return { ok: true, sha: body.sha };
+  }
+
+  function githubPutLayout(sha) {
+    var payload = { version: LAYOUT_VERSION, placements: buildPlacementsMap() };
+    var body = {
+      message: "Update layout.json via Testers Ranking",
+      content: utf8ToBase64(JSON.stringify(payload, null, 2)),
+      branch: GITHUB_BRANCH
+    };
+    if (sha) body.sha = sha; // omitted entirely (not null) tells GitHub to create rather than update
+    return fetch(githubApiUrl(GITHUB_LAYOUT_PATH), {
+      method: "PUT",
+      headers: {
+        "Authorization": "Bearer " + getGithubToken(),
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
+    });
+  }
+
+  // GitHub returns 403 for both "no permission" and "rate limited" —
+  // x-ratelimit-remaining is what actually tells them apart.
+  function classifyGithubFailure(res) {
+    if (!res) return "Save failed"; // network/CORS-level failure, no response at all
+    if (res.status === 401) return "Bad token";
+    if (res.status === 403) {
+      return res.headers.get("x-ratelimit-remaining") === "0" ? "Rate limited" : "No permission";
+    }
+    if (res.status === 409) return "Changed on GitHub";
+    return "Save failed";
+  }
+
+  var saveGithubDefaultLabel = saveGithubBtn.textContent;
+  var saveGithubFeedbackTimer = null;
+
+  function flashSaveGithubBtn(label) {
+    clearTimeout(saveGithubFeedbackTimer);
+    saveGithubBtn.textContent = label;
+    saveGithubFeedbackTimer = setTimeout(function () {
+      saveGithubBtn.textContent = saveGithubDefaultLabel;
+    }, 1500);
+  }
+
+  async function saveToGithub() {
+    if (saveGithubInFlight || githubUiState !== "connected") return;
+
+    saveGithubInFlight = true;
+    saveGithubBtn.disabled = true;
+    clearTimeout(saveGithubFeedbackTimer);
+    saveGithubBtn.textContent = "Saving…"; // no auto-revert — shouldn't flip back while still waiting
+
+    try {
+      var shaResult = await githubGetSha();
+      if (!shaResult.ok) {
+        // A confirmed bad token shouldn't keep claiming "connected" —
+        // leave a path back to reconnecting instead of failing forever.
+        if (shaResult.status === 401) setGithubUiState("disconnected");
+        flashSaveGithubBtn(classifyGithubFailure({ status: shaResult.status, headers: shaResult.headers }));
+        return;
+      }
+
+      var putRes = await githubPutLayout(shaResult.sha);
+      if (!putRes.ok) {
+        if (putRes.status === 401) setGithubUiState("disconnected");
+        // On a 409 (someone/something else changed the file between GET
+        // and PUT — most plausibly a second open tab), fail with a clear
+        // message rather than silently re-fetching and overwriting: that
+        // would discard whatever changed it with no diff shown to anyone.
+        flashSaveGithubBtn(classifyGithubFailure(putRes));
+        return;
+      }
+
+      flashSaveGithubBtn("Saved!");
+    } catch (err) {
+      console.warn("Could not save layout to GitHub:", err); // never log the token itself
+      flashSaveGithubBtn("Save failed");
+    } finally {
+      saveGithubInFlight = false;
+      saveGithubBtn.disabled = false;
+    }
+  }
+
+  saveGithubBtn.addEventListener("click", saveToGithub);
+
+  // No IndexedDB/permission round-trip needed (just a synchronous
+  // localStorage read), so this doesn't need to join the
+  // loadDefaultLibrary().then(initFolderSync) chain above.
+  initGithubSync();
 
   // -------------------------------------------------------------
   // Export

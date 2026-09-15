@@ -45,6 +45,22 @@ png;base64,...";` declaration), not just dropping in a new file. `assets/backgro
 in the repo as the canonical source image and for anyone reading the file layout to know what the
 embedded data actually is — the app just never loads it directly.
 
+**Two independent write-back paths target `assets/items/layout.json`.** Folder sync (section 5)
+writes it via the local File System Access API when a folder is connected. "Save to GitHub" (also
+section 5) writes the same file via the GitHub REST API, directly from the browser, when the deployer
+has configured their own repo:
+```js
+var GITHUB_OWNER = "";          // e.g. "vime-test" — deployer fills in for their own fork
+var GITHUB_REPO = "";           // e.g. "Testers-ranking"
+var GITHUB_BRANCH = "main";     // must match whichever branch GitHub Pages actually deploys from
+```
+Left blank (the shipped default), the whole GitHub-save feature stays hidden — same
+feature-detect-and-hide pattern `FILE_SYSTEM_SUPPORTED` already uses for folder sync. A `GITHUB_BRANCH`
+that doesn't match the branch Pages actually serves would silently write to a branch nobody's
+deploying — worth checking when configuring a fork. These two write-back paths are unrelated
+transports triggered differently (auto-on-drop locally, manual click for GitHub) and don't
+coordinate with each other — see "GitHub save" in section 5 for the full story.
+
 ---
 
 ## 2. The canvas grid
@@ -173,6 +189,10 @@ Board placement for folder-backed items is also mirrored to `layout.json` on dis
 "Board layout") — but that file is never part of in-memory `state`; it's read once, on connect, to
 seed `placement`.
 
+"Save to GitHub" (section 5) reads `fileName`/`placement` off the very same `state.items` too — it's
+the same identity, just written to a different destination (the repo, via the GitHub API, on a manual
+click) than folder sync's local-disk `layout.json`. No new field on the item shape for this.
+
 ---
 
 ## 4. Layout
@@ -182,28 +202,32 @@ seed `placement`.
 |  Testers Ranking       |                                          |
 |  [ Add image ]         |   +----+----+----+----+                  |
 |  [ Connect folder... ] |   |    |    |    |    |   Vault          |
-|                        |   +----+----+----+----+                  |
-|  +------+ +------+     |   |    |    |    |    |   Office         |
-|  | img  | | img  |     |   +----+----+----+----+                  |
-|  | name | | name |     |   |    |    |    |    |   Dorm           |
+|  [ Connect GitHub... ] |   +----+----+----+----+                  |
+|                        |   |    |    |    |    |   Office         |
 |  +------+ +------+     |   +----+----+----+----+                  |
-|  +------+              |   |    |    |    |    |   Sewer          |
-|  | img  |              |   +----+----+----+----+                  |
+|  | img  | | img  |     |   |    |    |    |    |   Dorm           |
+|  | name | | name |     |   +----+----+----+----+                  |
+|  +------+ +------+     |   |    |    |    |    |   Sewer          |
+|  +------+              |   +----+----+----+----+                  |
+|  | img  |              |                                          |
 |  | name |              |                                          |
 |  +------+              |                                          |
 |      (scrolls)         |                                          |
 |                        |                                          |
 |  [ Copy PNG ]          |                                          |
 |  [ Export PNG ]        |                                          |
+|  [ Save to GitHub ]    |                                          |
 +------------------------+------------------------------------------+
 ```
 
 **Left tray** — fixed 300px wide, full viewport height, three regions:
 
-- Header (pinned): the title, an "Add image" button, and a folder-sync control beneath it (hidden
-  entirely in browsers that don't support it — see section 5).
+- Header (pinned): the title, an "Add image" button, and two independent connection controls beneath
+  it — folder sync and GitHub save — each hidden until its own precondition is met (browser support
+  for folder sync, `GITHUB_OWNER`/`GITHUB_REPO` configured for GitHub save; see section 5).
 - Body (scrolls): a 2-column grid of unplaced items, each an avatar with its name underneath.
-- Footer (pinned): "Copy PNG" above "Export PNG", both full width — see section 6.
+- Footer (pinned): "Copy PNG", "Export PNG", then "Save to GitHub" (hidden until connected), all
+  full width — see section 6 for the first two, section 5 "GitHub save" for the third.
 
 **Right stage** — fills the remaining space, centers the canvas, and scales it to
 `min(availableWidth, availableHeight)` while keeping it square. The canvas is displayed at whatever
@@ -344,6 +368,61 @@ connected folder to persist *changes*; the shipped default library above survive
 with no folder connected, but anything added, moved, or removed beyond that shipped state does not,
 unless a folder is connected to write it to. See section 10.
 
+### GitHub save
+
+Folder sync (above) persists changes to a folder on the *editor's own local machine* — useless for
+the site **owner** wanting to rearrange avatars directly on the *live, hosted* page with no local dev
+environment involved at all. Since the site has no backend, that means the browser itself calling the
+GitHub REST API directly, which needs a credential — see section 1 for the `GITHUB_OWNER`/
+`GITHUB_REPO`/`GITHUB_BRANCH` constants that gate the whole feature.
+
+**Manual trigger, not automatic on every drop** — the one deliberate difference from folder sync's
+`writeLayoutFile()` above. Every GitHub Contents API write creates a real commit in the repo's
+permanent history; auto-saving on every drag would spam that history with one commit per drop.
+Batching everything into one click when the owner explicitly presses "Save to GitHub" avoids that.
+
+**Scope: rearrangement only.** Saves the same `buildPlacementsMap()` output folder sync's "Board
+layout" writes, just to a different destination — existing shipped avatars only. Does not add or
+upload new avatar images, does not touch `manifest.json`, and never reads GitHub state back into the
+board — write-only. (Items added via the "Add images" dialog on a page with no local folder connected
+don't get a `fileName` at all, so they're already excluded from what gets saved, same as they are for
+folder sync.)
+
+**Auth.** A fine-grained GitHub personal access token, scoped to just this one repo, "Contents: Read
+and write" permission only — the owner creates and pastes it in themselves via a "Connect GitHub…"
+dialog (parallel to "Connect folder…" and to the Add-images dialog), with an expiration set (the
+dialog's own copy recommends this — costs nothing, meaningfully bounds exposure if it ever leaks).
+Stored in `localStorage` under a namespaced key, never committed, sent only to `api.github.com`. The
+dialog states plainly: anyone with access to that browser's storage — including any installed
+extension with broad permissions, not just someone physically at the device — can read the token back
+out. This is for the owner's own trusted device, not a shared or public computer.
+
+**Writing.** On click: `GET .../contents/assets/items/layout.json` for the current file's `sha`
+(a 404 here isn't an error — it just means the file doesn't exist yet, so the `sha` is omitted from
+the next step and GitHub creates it), then `PUT` the same path with the new content, that `sha` (when
+one exists), and a fixed commit message. The `sha` is always fetched fresh immediately before writing
+— never reused from an earlier page load — to avoid a stale-`sha` conflict later.
+
+**Conflict handling.** A `409` (something else changed the file between the GET and the PUT — in
+practice, most plausibly a second open tab) fails with a clear "Changed on GitHub" message rather than
+silently re-fetching and overwriting: that would discard whatever changed it with no diff shown to
+anyone. A human deciding is the safer default for a personal, single-owner tool.
+
+**Button feedback**, same flash-then-revert pattern Copy PNG uses: "Saving…" while in flight (button
+disabled, no auto-revert), "Saved!" on success, and on failure a specific, honest label rather than
+one generic "Save failed" for everything the cause can actually distinguish — "Bad token" (401, which
+also reverts the Connect button back to "Connect GitHub…" rather than continuing to claim
+"connected" while every subsequent save would fail the same way), "No permission" or "Rate limited"
+(both are HTTP 403 from GitHub; told apart by the `x-ratelimit-remaining` response header), "Changed
+on GitHub" (409), or "Save failed" (network/CORS failure, or anything not otherwise distinguishable).
+
+**Independent from folder sync.** These are two unrelated write-back paths to the same file —
+different transport (GitHub API vs. local File System Access API), different trigger (manual vs.
+auto-on-drop) — that happen not to coordinate with each other. An owner using both in the same session
+(a local folder connected *and* a GitHub token configured) gets exactly what each does independently:
+every drop still auto-saves to the local folder as before, and "Save to GitHub" remains a separate,
+explicit action that only fires on click. Nothing here assumes the two stay in sync with each other.
+
 ---
 
 ## 6. Export
@@ -434,6 +513,18 @@ real `<button>` elements, the file dialog is reachable by keyboard.
   to restore," not an error — never block the tray/board from rendering.
 - Two entries in `layout.json` claim the same cell (e.g. a hand-edited file): the first one
   encountered wins; the rest stay in the tray.
+- `GITHUB_OWNER`/`GITHUB_REPO` left blank: the entire GitHub-save feature — connect row and Save
+  button both — stays hidden. Save is never clickable without a configured token; there's no path
+  where the button is visible but silently does nothing.
+- GitHub save fails: 401 (bad/expired token — also reverts the Connect button so there's a path back
+  to reconnecting, rather than continuing to claim "connected" while every save keeps failing), 403
+  permission-denied vs. 403 rate-limited (both the same HTTP status from GitHub; distinguished via the
+  `x-ratelimit-remaining` response header), 409 (something else changed the file between the read and
+  the write — fail with a clear message, don't auto-retry and silently overwrite it), or a
+  network/CORS failure. Each gets its own honest label on the button, not one generic failure message.
+- `GITHUB_BRANCH` doesn't match the branch GitHub Pages actually deploys from for a given fork: writes
+  would silently land somewhere nobody's serving. Nothing detects this automatically — it's on the
+  deployer to get right when configuring their fork.
 
 ---
 
@@ -464,6 +555,10 @@ real `<button>` elements, the file dialog is reachable by keyboard.
       simply isn't shown.
 - [ ] Opening the site fresh — no folder connected, no prior session — shows the built-in
       `assets/items/` library already in its saved rooms, in every major browser, not just Chrome/Edge.
+- [ ] With `GITHUB_OWNER`/`GITHUB_REPO` configured, the owner can connect a repo-scoped fine-grained
+      token, click "Save to GitHub", and see the resulting commit land in their repo's history.
+- [ ] GitHub-save failure causes are distinguishable on the button itself (bad token, no permission,
+      rate limited, conflict, generic failure), not just visible in the console.
 
 ---
 
@@ -471,13 +566,17 @@ real `<button>` elements, the file dialog is reachable by keyboard.
 
 More or fewer floors, custom floor names, more than 4 slots per floor, sharing links, undo.
 
-**Persisting changes requires a connected folder**, exactly like the avatar library does (section 5,
-"Board layout"). The shipped default library (section 5, "Default library") survives a reload with no
-folder connected — that's the point of it — but anything you change beyond that shipped state (new
-avatars, moved avatars, removed avatars) needs a connected folder to write to, or it's gone on
-reload. Switching to a *different* folder mid-session (clicking "Folder: …" again while already
-connected) isn't specifically handled beyond what section 5 already describes — items from the
-previous folder stay in state until removed.
+**Persisting changes requires either a connected folder or a configured GitHub token** — the shipped
+default library (section 5, "Default library") survives a reload with neither, but anything you
+change beyond that shipped state needs one of the two write-back paths (section 5, "Board layout" /
+"GitHub save") to land anywhere, or it's gone on reload. Switching to a *different* folder mid-session
+(clicking "Folder: …" again while already connected) isn't specifically handled beyond what section 5
+already describes — items from the previous folder stay in state until removed.
+
+**GitHub save is deliberately narrow.** No adding or uploading new avatar images through it, no
+`manifest.json` updates, no reading GitHub's state back into the board (write-only), no OAuth flow, no
+backend or proxy of any kind — a pasted personal access token calling `api.github.com` directly is the
+whole mechanism. Rearranging the existing shipped avatars and pressing Save is the entire feature.
 
 Keep the data model clean enough that slot and floor counts, and the geometry constants in section 2,
 are constants at the top of `app.js` rather than numbers scattered through the code.

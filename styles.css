@@ -490,6 +490,13 @@ button {
   color: var(--stone-50);
 }
 
+.add-dialog p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--stone-300);
+}
+
 .file-field {
   display: flex;
   flex-direction: column;
@@ -502,6 +509,16 @@ button {
   color: var(--stone-200);
   font-family: inherit;
   font-size: 12px;
+}
+
+.file-field input[type="password"] {
+  background: var(--stone-900);
+  border: 1px solid var(--stone-600);
+  color: var(--stone-50);
+  padding: 8px 10px;
+  border-radius: 3px;
+  font-family: inherit;
+  font-size: 13px;
 }
 
 .file-rows {
