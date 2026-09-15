@@ -225,6 +225,12 @@ button {
   visibility: hidden;
 }
 
+body.dragging-item,
+body.dragging-item .tray-item,
+body.dragging-item .placed-item {
+  cursor: grabbing;
+}
+
 .tray-item .avatar {
   width: 64px;
   height: 64px;

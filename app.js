@@ -74,8 +74,8 @@
   // whole feature stays hidden. GITHUB_BRANCH must match whichever
   // branch GitHub Pages actually deploys from for this repo — a
   // mismatch here silently writes to a branch nobody's serving.
-  var GITHUB_OWNER = "vime-test";
-  var GITHUB_REPO = "Testers-ranking";
+  var GITHUB_OWNER = "Yan-Sidoryk";
+  var GITHUB_REPO = "Image-ranking";
   var GITHUB_BRANCH = "main";
   var GITHUB_TOKEN_KEY = "testers-ranking:github-token"; // namespaced — this repo gets forked
   var GITHUB_LAYOUT_PATH = DEFAULT_LIBRARY_DIR + "layout.json";
@@ -496,6 +496,7 @@
     pending.started = true;
     pending.originEl.classList.add("vacated");
     gridEl.classList.add("dragging");
+    document.body.classList.add("dragging-item");
 
     buildGhost();
     positionGhost(e);
@@ -597,6 +598,7 @@
       dragGhost.hidden = true;
       dragGhost.innerHTML = "";
       gridEl.classList.remove("dragging");
+      document.body.classList.remove("dragging-item");
       setDropTarget(null);
 
       if (commit) {
