@@ -99,10 +99,19 @@ button {
 
 .tray-title {
   margin: 0 0 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: 16px;
   font-weight: 700;
   letter-spacing: 0.02em;
   color: var(--stone-50);
+}
+
+.tray-logo {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
 }
 
 .tray-body {
@@ -164,6 +173,14 @@ button {
 
 .folder-row {
   margin-top: 8px;
+}
+
+/* Unsaved-changes indicator — a small dot after the label, so it's
+   clear there's something "Save to GitHub" hasn't pushed yet. */
+#saveGithubBtn.dirty::after {
+  content: "•";
+  margin-left: 6px;
+  color: #e8b64a;
 }
 
 .btn-ghost {
@@ -579,5 +596,42 @@ button {
   .tray {
     width: 220px;
     flex-basis: 220px;
+  }
+}
+
+/* Phone-width: stack instead of side-by-side — the board goes full
+   width at the top, the tray/menu below it, and the page scrolls as a
+   whole (the desktop layout instead clips to 100vh and scrolls the
+   tray body internally, which only works with a bounded-height side
+   column). .stage gets its own aspect-ratio:1/1 here so its height is
+   derived purely from its (now full-viewport) width — resizeStage()'s
+   existing Math.min(rect.width, rect.height) then resolves to the
+   width on its own, no JS changes needed. */
+@media (max-width: 640px) {
+  html, body {
+    height: auto;
+    overflow: auto;
+  }
+
+  .app {
+    flex-direction: column;
+    height: auto;
+    min-height: 100vh;
+  }
+
+  .stage {
+    order: 1;
+    flex: 0 0 auto;
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    padding: 0;
+  }
+
+  .tray {
+    order: 2;
+    width: 100%;
+    flex: 0 0 auto;
+    border-right: none;
+    border-top: 1px solid var(--stone-700);
   }
 }

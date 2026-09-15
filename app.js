@@ -79,7 +79,9 @@
   var GITHUB_BRANCH = "main";
   var GITHUB_TOKEN_KEY = "testers-ranking:github-token"; // namespaced — this repo gets forked
   var GITHUB_LAYOUT_PATH = DEFAULT_LIBRARY_DIR + "layout.json";
+  var GITHUB_MANIFEST_PATH = DEFAULT_LIBRARY_DIR + "manifest.json";
   var GITHUB_CONFIGURED = !!(GITHUB_OWNER && GITHUB_REPO);
+  var LAYOUT_VERSION = 1;
 
   // -------------------------------------------------------------
   // State
@@ -101,8 +103,6 @@
   var addImageBtn = document.getElementById("addImageBtn");
   var copyBtn = document.getElementById("copyBtn");
   var exportBtn = document.getElementById("exportBtn");
-  var folderRow = document.getElementById("folderRow");
-  var folderBtn = document.getElementById("folderBtn");
   var githubRow = document.getElementById("githubRow");
   var githubConnectBtn = document.getElementById("githubConnectBtn");
   var saveGithubBtn = document.getElementById("saveGithubBtn");
@@ -156,8 +156,9 @@
     return m ? m[0] : "";
   }
 
-  // Shared by the Add-image dialog and folder sync below — both need
-  // "raw File -> data URL -> decoded Image" before an item is usable.
+  // Shared by the Add-image dialog and the default-library loader below —
+  // both need "raw File/Blob -> data URL -> decoded Image" before an
+  // item is usable.
   function readAsDataURL(file) {
     return new Promise(function (resolve, reject) {
       var reader = new FileReader();
@@ -431,8 +432,11 @@
     var item = getItem(id);
     if (!item || item.placement !== null) return; // must be in tray
     state.items = state.items.filter(function (it) { return it.id !== id; });
+    // Already-committed avatars need their file deleted on the next
+    // GitHub save; one never saved before just vanishes with no trace.
+    if (item.origin === "synced" && item.fileName) pendingDeletions.push(item.fileName);
     render();
-    deleteItemFile(item); // best-effort; no-op if not folder-backed
+    markDirty();
   }
 
   // -------------------------------------------------------------
@@ -618,7 +622,7 @@
       if (pending.originType === "cell") {
         item.placement = null;
         render();
-        writeLayoutFile();
+        markDirty();
       }
       return;
     }
@@ -642,7 +646,7 @@
 
     lastDroppedItemId = item.id;
     render();
-    writeLayoutFile();
+    markDirty();
   }
 
   function onPointerUp(e) {
@@ -695,7 +699,7 @@
     var entry = {
       tempId: "tmp_" + (idCounter++),
       name: stripExtension(file.name),
-      file: file, // kept so a folder-connected save can write the original bytes
+      ext: extensionOf(file.name) || ".png", // kept since item.name loses it; needed for the GitHub filename
       dataUrl: null,
       image: null,
       ready: false
@@ -752,44 +756,47 @@
 
     var toCommit = pendingFiles.slice();
     Promise.all(toCommit.map(function (entry) { return entry.readyPromise; })).then(function () {
-      var newlyAdded = []; // { item, file } — file needed to write to the folder, if connected
       toCommit.forEach(function (entry) {
         if (entry.failed) return;
         var trimmedName = entry.name.trim() || "Untitled";
-        var item = {
+        state.items.push({
           id: genId(),
           name: trimmedName,
-          src: entry.dataUrl,
+          src: entry.dataUrl, // data URL doubles as the blob payload for "Save to GitHub"
           image: entry.image,
           placement: null,
-          fileName: null
-        };
-        state.items.push(item);
-        newlyAdded.push({ item: item, file: entry.file });
+          fileName: null,
+          fileExt: entry.ext,
+          origin: "pending" // not yet committed to the repo
+        });
       });
       render();
       addDialog.close();
-      saveNewItemsToFolder(newlyAdded); // fire-and-forget; no-op if no folder connected
+      markDirty();
     });
   });
 
   // -------------------------------------------------------------
   // Default library — the avatar set shipped with the site itself, so
-  // every visitor sees it populated without needing to connect a
-  // folder (which only works in Chrome/Edge, and only for a folder on
-  // *their own* machine — useless for showing a curated set on a
-  // hosted page). Loaded via plain fetch()/<img>, so it works in every
-  // browser; it just silently does nothing under file:// (fetch to a
-  // local file is blocked there — Connect Folder remains the way to
-  // work with this same folder locally).
+  // every visitor sees it populated on load. Loaded via plain
+  // fetch()/<img>, so it works in every browser; it just silently does
+  // nothing under file:// (fetch to a local file is blocked there —
+  // serve the site over http(s), e.g. via a local static server, to see
+  // the library while developing).
   //
   // DEFAULT_LIBRARY_DIR/manifest.json is a plain JSON array of
   // filenames — there's no way to ask a static file host to list a
-  // directory's contents, so this has to be generated by hand and
-  // regenerated whenever files are added to or removed from the
-  // folder (layout.json only records *placed* items, so it can't
-  // stand in for this — an avatar left in the tray wouldn't be in it).
+  // directory's contents, so this file is the source of truth for what
+  // exists. "Save to GitHub" (below) keeps it in sync automatically
+  // whenever avatars are added or removed from the board.
+  //
+  // layout.json only records *placed* items, so it can't stand in for
+  // the manifest — an avatar left in the tray wouldn't be in it.
   // -------------------------------------------------------------
+
+  function itemHasFile(fileName) {
+    return state.items.some(function (it) { return it.fileName === fileName; });
+  }
 
   async function addDefaultLibraryItem(fileName, cell) {
     var res = await fetch(DEFAULT_LIBRARY_DIR + fileName);
@@ -803,7 +810,8 @@
       src: dataUrl,
       image: img,
       placement: isValidCell(cell) ? { row: cell.row, slot: cell.slot } : null,
-      fileName: fileName
+      fileName: fileName,
+      origin: "synced" // already a committed file in the repo
     });
   }
 
@@ -838,213 +846,13 @@
       render();
     } catch (err) {
       // fetch() itself unavailable (e.g. a real file:// open, where local
-      // fetches are blocked) — silently skip. Connect Folder still works
-      // for local use; nothing here should block that.
+      // fetches are blocked) — silently skip.
     }
   }
 
   // -------------------------------------------------------------
-  // Folder sync — persists uploaded avatars as real files on disk via
-  // the File System Access API, so the tray repopulates itself next
-  // time the folder is reconnected instead of starting empty.
-  //
-  // Chrome/Edge only (no Firefox/Safari support); the whole feature is
-  // feature-detected and stays hidden where it's unavailable. This
-  // section uses async/await (unlike the rest of the file's ES5 style)
-  // because the directory-entries API is only usable as an async
-  // iterator — a browser new enough for showDirectoryPicker already
-  // supports it natively, so it costs nothing in compatibility.
-  // -------------------------------------------------------------
-
-  var FILE_SYSTEM_SUPPORTED = !!window.showDirectoryPicker;
-  var folderHandle = null;
-  var folderUiState = "unsupported"; // 'unsupported' | 'disconnected' | 'needs-permission' | 'connected'
-  var folderPickerOpen = false;
-
-  var IDB_NAME = "building-tiers";
-  var IDB_STORE = "handles";
-  var IDB_KEY = "imageFolder";
-
-  var LAYOUT_FILE_NAME = "layout.json"; // reserved filename inside the connected folder
-  var LAYOUT_VERSION = 1;
-  // Set for the rest of the session if layout.json exists but couldn't be
-  // read (permissions hiccup, IO error) — distinct from "no file yet".
-  // Without this, a transient read failure would look identical to "empty",
-  // and the next write would overwrite a perfectly good file with a much
-  // smaller map, permanently losing whatever it couldn't read.
-  var layoutWritesSuspended = false;
-
-  function idbOpen() {
-    return new Promise(function (resolve, reject) {
-      var req = indexedDB.open(IDB_NAME, 1);
-      req.onupgradeneeded = function () { req.result.createObjectStore(IDB_STORE); };
-      req.onsuccess = function () { resolve(req.result); };
-      req.onerror = function () { reject(req.error); };
-    });
-  }
-
-  function idbGetHandle() {
-    return idbOpen().then(function (db) {
-      return new Promise(function (resolve, reject) {
-        var tx = db.transaction(IDB_STORE, "readonly");
-        var req = tx.objectStore(IDB_STORE).get(IDB_KEY);
-        req.onsuccess = function () { resolve(req.result || null); };
-        req.onerror = function () { reject(req.error); };
-      });
-    });
-  }
-
-  function idbSetHandle(handle) {
-    return idbOpen().then(function (db) {
-      return new Promise(function (resolve, reject) {
-        var tx = db.transaction(IDB_STORE, "readwrite");
-        tx.objectStore(IDB_STORE).put(handle, IDB_KEY);
-        tx.oncomplete = function () { resolve(); };
-        tx.onerror = function () { reject(tx.error); };
-      });
-    });
-  }
-
-  function setFolderUiState(nextState, name) {
-    folderUiState = nextState;
-    if (nextState === "unsupported") {
-      folderRow.hidden = true;
-      return;
-    }
-    folderRow.hidden = false;
-    if (nextState === "disconnected") {
-      folderBtn.textContent = "Connect folder…";
-    } else if (nextState === "needs-permission") {
-      folderBtn.textContent = "Reconnect “" + (name || "folder") + "”";
-    } else if (nextState === "connected") {
-      folderBtn.textContent = "Folder: " + (name || "connected");
-    }
-  }
-
-  function itemHasFile(fileName) {
-    return state.items.some(function (it) { return it.fileName === fileName; });
-  }
-
-  function sanitizeFileName(name) {
-    var cleaned = name.replace(/[<>:"/\\|?*\x00-\x1F]/g, "").replace(/[\s.]+$/, "");
-    return cleaned.slice(0, 150) || "untitled";
-  }
-
-  async function fileExists(dirHandle, name) {
-    try {
-      await dirHandle.getFileHandle(name, { create: false });
-      return true;
-    } catch (err) {
-      return false;
-    }
-  }
-
-  async function uniqueFileName(dirHandle, baseName, ext) {
-    var candidate = baseName + ext;
-    var n = 2;
-    while (await fileExists(dirHandle, candidate)) {
-      candidate = baseName + " (" + n + ")" + ext;
-      n++;
-    }
-    return candidate;
-  }
-
-  async function addItemFromFileHandle(fileHandle) {
-    var file = await fileHandle.getFile();
-    var dataUrl = await readAsDataURL(file);
-    var img = await decodeImage(dataUrl);
-    state.items.push({
-      id: genId(),
-      name: stripExtension(fileHandle.name),
-      src: dataUrl,
-      image: img,
-      placement: null,
-      fileName: fileHandle.name
-    });
-  }
-
-  async function syncFromFolder() {
-    if (!folderHandle) return;
-    var entries = [];
-    for await (var entry of folderHandle.values()) {
-      if (entry.kind === "file" && IMAGE_EXT_RE.test(entry.name) && !itemHasFile(entry.name)) {
-        entries.push(entry);
-      }
-    }
-    entries.sort(function (a, b) { return a.name.localeCompare(b.name); });
-    for (var i = 0; i < entries.length; i++) {
-      try {
-        await addItemFromFileHandle(entries[i]);
-      } catch (err) {
-        console.warn("Could not load " + entries[i].name + " from folder:", err);
-      }
-    }
-
-    var layoutResult = await readLayoutFile();
-    if (!layoutResult.ok) layoutWritesSuspended = true;
-    applyLayoutToItems(layoutResult.placements);
-
-    render();
-  }
-
-  async function saveItemFile(item, file) {
-    if (!folderHandle || !file) return;
-    var ext = extensionOf(file.name) || ".png";
-    var baseName = sanitizeFileName(item.name);
-    try {
-      var fileName = await uniqueFileName(folderHandle, baseName, ext);
-      var handle = await folderHandle.getFileHandle(fileName, { create: true });
-      var writable = await handle.createWritable();
-      await writable.write(file);
-      await writable.close();
-      item.fileName = fileName;
-    } catch (err) {
-      console.warn("Could not save \"" + item.name + "\" to the connected folder:", err);
-    }
-  }
-
-  async function saveNewItemsToFolder(newItems) {
-    if (!folderHandle) return;
-    for (var i = 0; i < newItems.length; i++) {
-      await saveItemFile(newItems[i].item, newItems[i].file);
-    }
-  }
-
-  function dataUrlToFile(dataUrl, name) {
-    return fetch(dataUrl).then(function (res) { return res.blob(); }).then(function (blob) {
-      return new File([blob], name, { type: blob.type });
-    });
-  }
-
-  // Items added before any folder was connected have no fileName yet;
-  // write them out too so connecting a folder doesn't leave anything behind.
-  async function backfillExistingItems() {
-    if (!folderHandle) return;
-    var toSave = state.items.filter(function (it) { return !it.fileName; });
-    for (var i = 0; i < toSave.length; i++) {
-      var item = toSave[i];
-      try {
-        var file = await dataUrlToFile(item.src, item.name);
-        await saveItemFile(item, file);
-      } catch (err) {
-        console.warn("Could not back-fill \"" + item.name + "\" into the connected folder:", err);
-      }
-    }
-  }
-
-  function deleteItemFile(item) {
-    if (!folderHandle || !item.fileName) return;
-    folderHandle.removeEntry(item.fileName).catch(function () {
-      /* best-effort — file may already be gone; state removal already happened */
-    });
-  }
-
-  // -------------------------------------------------------------
-  // Board-layout persistence — remembers which room each folder-backed
-  // avatar was standing in, mirrored to layout.json in the connected
-  // folder. Rides on the same folderHandle as the images themselves:
-  // with no folder connected there's nothing to write this to, exactly
-  // like the avatars it applies to.
+  // Board layout — buildPlacementsMap() feeds layout.json in a GitHub
+  // save (below); isValidCell() validates cells read back out of it.
   // -------------------------------------------------------------
 
   function buildPlacementsMap() {
@@ -1063,158 +871,49 @@
       typeof v.slot === "number" && v.slot >= 0 && v.slot < SLOTS;
   }
 
-  // Serialized write queue. Deliberately does NOT snapshot state.items at
-  // call time and queue the snapshots — per the File System Access API,
-  // two overlapping writable streams to the same file each keep an
-  // independent swap file, and whichever close() resolves *last* wins,
-  // regardless of call order. Queuing the operation itself instead (it
-  // reads state.items fresh when it actually runs) guarantees only one
-  // write is ever in flight and it always reflects true current state.
-  var layoutWriteChain = Promise.resolve();
-
-  function writeLayoutFile() {
-    if (!folderHandle || layoutWritesSuspended) return;
-    // The .catch(noop) matters: without it, one failed write would
-    // permanently poison every subsequent queued write, since a
-    // rejected promise short-circuits a .then() chain forever.
-    layoutWriteChain = layoutWriteChain.catch(function () {}).then(doWriteLayout);
-    return layoutWriteChain;
+  function sanitizeFileName(name) {
+    var cleaned = name.replace(/[<>:"/\\|?*\x00-\x1F]/g, "").replace(/[\s.]+$/, "");
+    return cleaned.slice(0, 150) || "untitled";
   }
-
-  async function doWriteLayout() {
-    if (!folderHandle) return;
-    try {
-      var handle = await folderHandle.getFileHandle(LAYOUT_FILE_NAME, { create: true });
-      var writable = await handle.createWritable();
-      await writable.write(JSON.stringify({ version: LAYOUT_VERSION, placements: buildPlacementsMap() }));
-      await writable.close();
-    } catch (err) {
-      console.warn("Could not save layout to the connected folder:", err);
-    }
-  }
-
-  // Never throws out. { ok: false, ... } means "couldn't tell" (permission
-  // hiccup, IO error) as opposed to "genuinely no file yet" — see
-  // layoutWritesSuspended above for why that distinction matters.
-  async function readLayoutFile() {
-    if (!folderHandle) return { ok: true, placements: {} };
-    try {
-      var handle = await folderHandle.getFileHandle(LAYOUT_FILE_NAME, { create: false });
-      var file = await handle.getFile();
-      var parsed = JSON.parse(await file.text());
-      return { ok: true, placements: (parsed && parsed.placements) || {} };
-    } catch (err) {
-      if (err && err.name === "NotFoundError") return { ok: true, placements: {} }; // no file yet
-      console.warn("Could not read layout.json from the connected folder:", err);
-      return { ok: false, placements: {} };
-    }
-  }
-
-  // Seeds .placement on freshly-synced items from a saved layout map.
-  // Never relocates something already placed this session, and a corrupt
-  // file claiming two files for one cell resolves first-one-wins, rest
-  // stay in the tray.
-  function applyLayoutToItems(placementsMap) {
-    state.items.forEach(function (it) {
-      if (it.placement !== null || !it.fileName) return;
-      var cell = placementsMap[it.fileName];
-      if (!isValidCell(cell)) return;
-      if (findItemAtCell(cell.row, cell.slot)) return;
-      it.placement = { row: cell.row, slot: cell.slot };
-    });
-  }
-
-  async function pickFolder() {
-    if (folderPickerOpen) return; // guard rapid double-clicks, same as the Add-image dialog
-    folderPickerOpen = true;
-    try {
-      var handle = await window.showDirectoryPicker({ mode: "readwrite" });
-      folderHandle = handle;
-      await idbSetHandle(handle);
-      setFolderUiState("connected", handle.name);
-      await syncFromFolder();
-      await backfillExistingItems();
-      // Captures layout immediately if items were already placed before this
-      // folder was ever connected, rather than waiting for the next drag.
-      await writeLayoutFile();
-    } catch (err) {
-      if (err && err.name !== "AbortError") { // AbortError = user cancelled the picker; not an error
-        console.warn("Could not connect a folder:", err);
-      }
-    } finally {
-      folderPickerOpen = false;
-    }
-  }
-
-  async function reconnectFolder() {
-    if (!folderHandle) return pickFolder();
-    try {
-      var perm = await folderHandle.requestPermission({ mode: "readwrite" });
-      if (perm === "granted") {
-        setFolderUiState("connected", folderHandle.name);
-        await syncFromFolder();
-      }
-      // else: user declined: stay in 'needs-permission', nothing else to do
-    } catch (err) {
-      console.warn("Could not reconnect the folder:", err);
-    }
-  }
-
-  folderBtn.addEventListener("click", function () {
-    if (folderUiState === "needs-permission") {
-      reconnectFolder();
-    } else {
-      pickFolder();
-    }
-  });
-
-  async function initFolderSync() {
-    if (!FILE_SYSTEM_SUPPORTED) {
-      setFolderUiState("unsupported");
-      return;
-    }
-    try {
-      var handle = await idbGetHandle();
-      if (!handle) {
-        setFolderUiState("disconnected");
-        return;
-      }
-      folderHandle = handle;
-      var perm = await handle.queryPermission({ mode: "readwrite" });
-      if (perm === "granted") {
-        setFolderUiState("connected", handle.name);
-        await syncFromFolder();
-      } else {
-        setFolderUiState("needs-permission", handle.name);
-      }
-    } catch (err) {
-      console.warn("Folder sync could not resume automatically:", err);
-      setFolderUiState("disconnected");
-    }
-  }
-
-  // Load the built-in library first, then let folder sync resume — that
-  // order (rather than running them in parallel) means folder sync's
-  // itemHasFile() dedup reliably sees what the default library already
-  // added, instead of racing it if the same folder happens to be the
-  // one already connected locally.
-  loadDefaultLibrary().then(initFolderSync);
 
   // -------------------------------------------------------------
-  // GitHub save — lets the site owner (not visitors) push the current
-  // board layout back to GITHUB_LAYOUT_PATH in their own repo via the
-  // GitHub Contents API, directly from the browser. Entirely separate
-  // from folder sync's writeLayoutFile() above: different transport
-  // (GitHub API vs local File System Access API), different trigger
-  // (manual click, not automatic on every drop — each API write is a
-  // permanent commit, and auto-saving every drag would spam the repo's
-  // history with one commit per drop). The two don't share state and
-  // don't need to agree with each other.
+  // Unsaved-changes tracking — every board edit (move, add, remove)
+  // just marks the board dirty; nothing persists until "Save to GitHub"
+  // runs and commits layout + manifest + any new/removed images
+  // together (see the GitHub save section below).
+  // -------------------------------------------------------------
+
+  var isDirty = false;
+  var pendingDeletions = []; // fileName strings: synced items removed this session
+
+  function markDirty() {
+    isDirty = true;
+    updateSaveGithubUi();
+  }
+
+  window.addEventListener("beforeunload", function (e) {
+    if (!isDirty || githubUiState !== "connected") return;
+    e.preventDefault();
+    e.returnValue = "";
+  });
+
+  loadDefaultLibrary();
+
+  // -------------------------------------------------------------
+  // GitHub save — the only persistence mechanism the board has. Pushes
+  // layout.json, manifest.json, and any newly added/removed avatar
+  // images to the repo, all as ONE atomic commit via the Git Data API
+  // (blob -> tree -> commit -> ref update) rather than several separate
+  // Contents-API PUTs: a save can touch N new images plus two JSON
+  // files at once, and a partial failure partway through separate PUTs
+  // would leave the repo inconsistent (e.g. an image uploaded but
+  // manifest.json not updated to list it). With one commit, either
+  // everything in the save lands or nothing does, with exactly one
+  // conflict-detection point — the ref update in step 4 below.
   //
-  // Scope: rearrangement of the existing shipped avatars only —
-  // buildPlacementsMap() (above) is reused as-is. This does not upload
-  // new avatar images, update manifest.json, or ever read GitHub state
-  // back into the board; it's write-only.
+  // Manual trigger only (the "Save to GitHub" button), never automatic
+  // on every drag or every Add-image submit — each save is a permanent
+  // commit, and autosaving every edit would spam the repo's history.
   // -------------------------------------------------------------
 
   var githubUiState = "unconfigured"; // 'unconfigured' | 'disconnected' | 'connected'
@@ -1238,6 +937,15 @@
       githubConnectBtn.textContent = "GitHub: connected";
       saveGithubBtn.hidden = false;
     }
+    updateSaveGithubUi();
+  }
+
+  // Small "unsaved changes" dot on the Save button, driven by isDirty
+  // (see the tracking section above) — a no-op while the button itself
+  // is hidden (unconfigured/disconnected).
+  function updateSaveGithubUi() {
+    if (saveGithubBtn.hidden) return;
+    saveGithubBtn.classList.toggle("dirty", isDirty);
   }
 
   function initGithubSync() {
@@ -1268,66 +976,137 @@
     githubTokenInput.value = ""; // never leave the token sitting in the DOM after the dialog closes
   });
 
-  function githubApiUrl(path) {
-    return "https://api.github.com/repos/" + GITHUB_OWNER + "/" + GITHUB_REPO +
-      "/contents/" + path + "?ref=" + encodeURIComponent(GITHUB_BRANCH);
+  function githubRepoUrl(suffix) {
+    return "https://api.github.com/repos/" + GITHUB_OWNER + "/" + GITHUB_REPO + suffix;
   }
 
+  function githubContentsUrl(path) {
+    return githubRepoUrl("/contents/" + path + "?ref=" + encodeURIComponent(GITHUB_BRANCH));
+  }
+
+  function githubHeaders(extra) {
+    var h = {
+      "Authorization": "Bearer " + getGithubToken(),
+      "Accept": "application/vnd.github+json"
+    };
+    if (extra) for (var k in extra) h[k] = extra[k];
+    return h;
+  }
+
+  // btoa()/atob() only handle Latin1; TextEncoder/TextDecoder round-trip
+  // the raw UTF-8 bytes so non-ASCII avatar names survive, even though
+  // filenames are ASCII-only today.
   function utf8ToBase64(str) {
-    // btoa() only handles Latin1; TextEncoder gets the raw UTF-8 bytes
-    // first so this survives non-ASCII avatar names down the line, even
-    // though layout.json's keys (filenames) are ASCII-only today.
     var bytes = new TextEncoder().encode(str);
     var binary = "";
     for (var i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
     return btoa(binary);
   }
 
-  // Fetches the current sha right before writing — never reused from an
-  // earlier load — to avoid a stale-sha 409 later. A 404 here isn't an
-  // error, it just means the file doesn't exist yet: sha comes back
-  // null, and the caller omits it from the PUT so GitHub creates it.
-  async function githubGetSha() {
-    var res = await fetch(githubApiUrl(GITHUB_LAYOUT_PATH), {
-      headers: {
-        "Authorization": "Bearer " + getGithubToken(),
-        "Accept": "application/vnd.github+json"
-      }
+  function base64ToUtf8(b64) {
+    var binary = atob(b64.replace(/\n/g, ""));
+    var bytes = new Uint8Array(binary.length);
+    for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
+  }
+
+  // Step 1 of the atomic save: read the branch head and its tree right
+  // before building the commit — never reused from an earlier load — so
+  // the ref-update at the end has a fresh base to fast-forward from.
+  async function githubGetRef() {
+    var res = await fetch(githubRepoUrl("/git/refs/heads/" + encodeURIComponent(GITHUB_BRANCH)), {
+      headers: githubHeaders()
     });
-    if (res.status === 404) return { ok: true, sha: null };
-    if (!res.ok) return { ok: false, status: res.status, headers: res.headers };
+    if (!res.ok) return { ok: false, res: res };
+    var body = await res.json();
+    return { ok: true, commitSha: body.object.sha };
+  }
+
+  async function githubGetTreeSha(commitSha) {
+    var res = await fetch(githubRepoUrl("/git/commits/" + commitSha), { headers: githubHeaders() });
+    if (!res.ok) return { ok: false, res: res };
+    var body = await res.json();
+    return { ok: true, treeSha: body.tree.sha };
+  }
+
+  // A 404 isn't an error — it just means no avatars have ever been saved
+  // via GitHub yet, so the manifest starts empty.
+  async function githubGetManifest() {
+    var res = await fetch(githubContentsUrl(GITHUB_MANIFEST_PATH), { headers: githubHeaders() });
+    if (res.status === 404) return { ok: true, names: [] };
+    if (!res.ok) return { ok: false, res: res };
+    var body = await res.json();
+    var names = JSON.parse(base64ToUtf8(body.content));
+    return { ok: true, names: Array.isArray(names) ? names : [] };
+  }
+
+  async function githubCreateBlob(base64Content) {
+    var res = await fetch(githubRepoUrl("/git/blobs"), {
+      method: "POST",
+      headers: githubHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ content: base64Content, encoding: "base64" })
+    });
+    if (!res.ok) return { ok: false, res: res };
     var body = await res.json();
     return { ok: true, sha: body.sha };
   }
 
-  function githubPutLayout(sha) {
-    var payload = { version: LAYOUT_VERSION, placements: buildPlacementsMap() };
-    var body = {
-      message: "Update layout.json via Testers Ranking",
-      content: utf8ToBase64(JSON.stringify(payload, null, 2)),
-      branch: GITHUB_BRANCH
-    };
-    if (sha) body.sha = sha; // omitted entirely (not null) tells GitHub to create rather than update
-    return fetch(githubApiUrl(GITHUB_LAYOUT_PATH), {
-      method: "PUT",
-      headers: {
-        "Authorization": "Bearer " + getGithubToken(),
-        "Accept": "application/vnd.github+json",
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(body)
+  async function githubCreateTree(baseTreeSha, entries) {
+    var res = await fetch(githubRepoUrl("/git/trees"), {
+      method: "POST",
+      headers: githubHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ base_tree: baseTreeSha, tree: entries })
+    });
+    if (!res.ok) return { ok: false, res: res };
+    var body = await res.json();
+    return { ok: true, sha: body.sha };
+  }
+
+  async function githubCreateCommit(message, treeSha, parentSha) {
+    var res = await fetch(githubRepoUrl("/git/commits"), {
+      method: "POST",
+      headers: githubHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ message: message, tree: treeSha, parents: [parentSha] })
+    });
+    if (!res.ok) return { ok: false, res: res };
+    var body = await res.json();
+    return { ok: true, sha: body.sha };
+  }
+
+  // Step 4, the single conflict-detection point: no `force`, so GitHub
+  // rejects this (422/409-shaped) if the branch moved since githubGetRef()
+  // read it — most plausibly someone else's save landing in between.
+  function githubUpdateRef(commitSha) {
+    return fetch(githubRepoUrl("/git/refs/heads/" + encodeURIComponent(GITHUB_BRANCH)), {
+      method: "PATCH",
+      headers: githubHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ sha: commitSha })
     });
   }
 
+  // Mirrors the old folder-sync uniqueFileName() suffixing convention
+  // ("name (2).ext", …), just checked against a plain name array instead
+  // of probing the filesystem.
+  function uniqueManifestFileName(existingNames, baseName, ext) {
+    var candidate = baseName + ext;
+    var n = 2;
+    while (existingNames.indexOf(candidate) !== -1) {
+      candidate = baseName + " (" + n + ")" + ext;
+      n++;
+    }
+    return candidate;
+  }
+
   // GitHub returns 403 for both "no permission" and "rate limited" —
-  // x-ratelimit-remaining is what actually tells them apart.
+  // x-ratelimit-remaining is what actually tells them apart. 409/422 are
+  // both shapes GitHub uses for "the branch moved since you read it".
   function classifyGithubFailure(res) {
     if (!res) return "Save failed"; // network/CORS-level failure, no response at all
     if (res.status === 401) return "Bad token";
     if (res.status === 403) {
       return res.headers.get("x-ratelimit-remaining") === "0" ? "Rate limited" : "No permission";
     }
-    if (res.status === 409) return "Changed on GitHub";
+    if (res.status === 409 || res.status === 422) return "Changed on GitHub";
     return "Save failed";
   }
 
@@ -1342,6 +1121,13 @@
     }, 1500);
   }
 
+  // A confirmed bad token shouldn't keep claiming "connected" — leave a
+  // path back to reconnecting instead of failing forever.
+  function handleGithubSaveFailure(res) {
+    if (res && res.status === 401) setGithubUiState("disconnected");
+    flashSaveGithubBtn(classifyGithubFailure(res));
+  }
+
   async function saveToGithub() {
     if (saveGithubInFlight || githubUiState !== "connected") return;
 
@@ -1351,29 +1137,86 @@
     saveGithubBtn.textContent = "Saving…"; // no auto-revert — shouldn't flip back while still waiting
 
     try {
-      var shaResult = await githubGetSha();
-      if (!shaResult.ok) {
-        // A confirmed bad token shouldn't keep claiming "connected" —
-        // leave a path back to reconnecting instead of failing forever.
-        if (shaResult.status === 401) setGithubUiState("disconnected");
-        flashSaveGithubBtn(classifyGithubFailure({ status: shaResult.status, headers: shaResult.headers }));
+      var refResult = await githubGetRef();
+      if (!refResult.ok) { handleGithubSaveFailure(refResult.res); return; }
+
+      var treeResult = await githubGetTreeSha(refResult.commitSha);
+      if (!treeResult.ok) { handleGithubSaveFailure(treeResult.res); return; }
+
+      var manifestResult = await githubGetManifest();
+      if (!manifestResult.ok) { handleGithubSaveFailure(manifestResult.res); return; }
+
+      var deletions = pendingDeletions.filter(function (name, i) { return pendingDeletions.indexOf(name) === i; });
+      var pendingItems = state.items.filter(function (it) { return it.origin === "pending"; });
+      var manifestNames = manifestResult.names.filter(function (n) { return deletions.indexOf(n) === -1; });
+      var treeEntries = [];
+      var assignedFileNames = {}; // item id -> fileName, committed onto real items only on full success
+
+      for (var i = 0; i < pendingItems.length; i++) {
+        var item = pendingItems[i];
+        var fileName = uniqueManifestFileName(manifestNames, sanitizeFileName(item.name), item.fileExt || ".png");
+        manifestNames.push(fileName);
+        assignedFileNames[item.id] = fileName;
+
+        var blobResult = await githubCreateBlob(item.src.split(",")[1]); // data URL -> raw base64 payload
+        if (!blobResult.ok) { handleGithubSaveFailure(blobResult.res); return; }
+        treeEntries.push({ path: DEFAULT_LIBRARY_DIR + fileName, mode: "100644", type: "blob", sha: blobResult.sha });
+      }
+
+      deletions.forEach(function (fileName) {
+        treeEntries.push({ path: DEFAULT_LIBRARY_DIR + fileName, mode: "100644", type: "blob", sha: null });
+      });
+
+      manifestNames.sort();
+      treeEntries.push({
+        path: GITHUB_MANIFEST_PATH, mode: "100644", type: "blob",
+        content: JSON.stringify(manifestNames, null, 2)
+      });
+
+      // Placements for pending items use their about-to-be-assigned
+      // filename — buildPlacementsMap() alone can't see a name that
+      // doesn't exist on the item yet.
+      var placements = buildPlacementsMap();
+      pendingItems.forEach(function (item) {
+        if (item.placement && assignedFileNames[item.id]) {
+          placements[assignedFileNames[item.id]] = { row: item.placement.row, slot: item.placement.slot };
+        }
+      });
+      treeEntries.push({
+        path: GITHUB_LAYOUT_PATH, mode: "100644", type: "blob",
+        content: JSON.stringify({ version: LAYOUT_VERSION, placements: placements }, null, 2)
+      });
+
+      var newTreeResult = await githubCreateTree(treeResult.treeSha, treeEntries);
+      if (!newTreeResult.ok) { handleGithubSaveFailure(newTreeResult.res); return; }
+
+      var commitResult = await githubCreateCommit("Update board via Testers Ranking", newTreeResult.sha, refResult.commitSha);
+      if (!commitResult.ok) { handleGithubSaveFailure(commitResult.res); return; }
+
+      var updateRes = await githubUpdateRef(commitResult.sha);
+      if (!updateRes.ok) {
+        // Rejected (branch moved since refResult was read) or a network
+        // failure — either way nothing was ever made reachable from the
+        // branch, so state/pendingDeletions/isDirty are left exactly as
+        // they were; clicking Save again re-reads the ref and retries.
+        handleGithubSaveFailure(updateRes);
         return;
       }
 
-      var putRes = await githubPutLayout(shaResult.sha);
-      if (!putRes.ok) {
-        if (putRes.status === 401) setGithubUiState("disconnected");
-        // On a 409 (someone/something else changed the file between GET
-        // and PUT — most plausibly a second open tab), fail with a clear
-        // message rather than silently re-fetching and overwriting: that
-        // would discard whatever changed it with no diff shown to anyone.
-        flashSaveGithubBtn(classifyGithubFailure(putRes));
-        return;
-      }
-
+      // Full success — only now commit the assigned filenames onto the
+      // real items and clear everything this save covered.
+      pendingItems.forEach(function (item) {
+        if (assignedFileNames[item.id]) {
+          item.fileName = assignedFileNames[item.id];
+          item.origin = "synced";
+        }
+      });
+      pendingDeletions = [];
+      isDirty = false;
+      updateSaveGithubUi();
       flashSaveGithubBtn("Saved!");
     } catch (err) {
-      console.warn("Could not save layout to GitHub:", err); // never log the token itself
+      console.warn("Could not save to GitHub:", err); // never log the token itself
       flashSaveGithubBtn("Save failed");
     } finally {
       saveGithubInFlight = false;
@@ -1383,9 +1226,8 @@
 
   saveGithubBtn.addEventListener("click", saveToGithub);
 
-  // No IndexedDB/permission round-trip needed (just a synchronous
-  // localStorage read), so this doesn't need to join the
-  // loadDefaultLibrary().then(initFolderSync) chain above.
+  // Just a synchronous localStorage read, so this doesn't need to wait
+  // on loadDefaultLibrary() above.
   initGithubSync();
 
   // -------------------------------------------------------------
