@@ -1,25 +1,13 @@
 {
   "version": 1,
   "placements": {
-    "_CHEN_.png": {
-      "row": 1,
-      "slot": 0
-    },
     "Aksyo.png": {
       "row": 2,
-      "slot": 2
-    },
-    "bloodbarf.png": {
-      "row": 0,
       "slot": 2
     },
     "Dusha.png": {
       "row": 0,
       "slot": 0
-    },
-    "fosques.png": {
-      "row": 3,
-      "slot": 1
     },
     "Hamitchi.png": {
       "row": 1,
@@ -37,13 +25,25 @@
       "row": 0,
       "slot": 1
     },
-    "saxie.png": {
-      "row": 2,
-      "slot": 1
-    },
     "Stozeks.png": {
       "row": 2,
       "slot": 0
+    },
+    "_CHEN_.png": {
+      "row": 1,
+      "slot": 0
+    },
+    "bloodbarf.png": {
+      "row": 0,
+      "slot": 2
+    },
+    "fosques.png": {
+      "row": 3,
+      "slot": 1
+    },
+    "saxie.png": {
+      "row": 3,
+      "slot": 2
     }
   }
 }
