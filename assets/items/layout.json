@@ -3,7 +3,7 @@
   "placements": {
     "Aksyo.png": {
       "row": 2,
-      "slot": 2
+      "slot": 1
     },
     "Dusha.png": {
       "row": 0,
@@ -43,7 +43,7 @@
     },
     "saxie.png": {
       "row": 2,
-      "slot": 1
+      "slot": 2
     }
   }
 }
