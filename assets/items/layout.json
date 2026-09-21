@@ -1,10 +1,6 @@
 {
   "version": 1,
   "placements": {
-    "Aksyo.png": {
-      "row": 2,
-      "slot": 1
-    },
     "Dusha.png": {
       "row": 0,
       "slot": 0
